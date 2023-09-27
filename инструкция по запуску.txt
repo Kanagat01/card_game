@@ -1,0 +1,11 @@
+0. Распаковать файлы с архива
+1. Установить python
+2. В командной строке перейти в папку с файлами
+3. Создать виртуальное окружение с помощью команды python -m venv venv
+4. Активировать его venv\scripts\activate
+5. Скачать зависимости проекта pip install -r requirements.txt
+6. Создать миграции python manage.py makemigrations
+7. Сделать миграции в бд python manage.py migrate
+6. Запустить командой python manage.py runserver
+
+Будет работать на 8000 порту локалхоста
