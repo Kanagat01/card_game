@@ -34,13 +34,13 @@ class Game(models.Model):
     )
 
     creator = models.OneToOneField(
-        Player, on_delete=models.CASCADE)
+        Player, on_delete=models.CASCADE, related_name='created_games')
     deck = models.ForeignKey('Deck', on_delete=models.CASCADE)
     members_num = models.IntegerField(choices=MEMBER_NUM_CHOICES)
     points_to_win = models.IntegerField()
     status = models.CharField(
         max_length=2, choices=GameStatus.choices, default=GameStatus.PLAYING)
-    winner = models.ForeignKey(Player, on_delete=models.SET_NULL, null=True)
+    winner = models.ForeignKey(Player, on_delete=models.SET_NULL, null=True, related_name='won_games')
 
     def __str__(self):
         return f'Game #{self.id}'
