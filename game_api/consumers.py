@@ -1,269 +1,430 @@
 import random
 import json
 
-from channels.generic.websocket import WebsocketConsumer
+from channels.generic.websocket import AsyncWebsocketConsumer
+from channels.db import database_sync_to_async
 from django.db.models import Max
-from asgiref.sync import async_to_sync
-from channels.layers import get_channel_layer
 from .models import *
 
 
-class GameWaitingConsumer(WebsocketConsumer):
-    def connect(self):
-        self.accept()
-        self.send_players_info()
+class GameConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        self.game = await database_sync_to_async(Game.objects.get)(
+            id=self.scope['url_route']['kwargs']['game_id']
+        )
+        await database_sync_to_async(self.game.save)()
+        try:
+            self.round_num = await get_round_num(self.game)
+        except:
+            pass
 
-    def disconnect(self, close_code):
-        pass
+        self.player_id = self.scope['url_route']['kwargs']['player_id']
+        self.player = await database_sync_to_async(Player.objects.get)(
+            id=self.player_id
+        )
 
-    def receive(self, text_data):
+        self.room_group_name = f"player_{self.player_id}"
+        await self.channel_layer.group_add(
+            self.room_group_name,
+            self.channel_name
+        )
+
+        await self.channel_layer.group_add(
+            "public_room",
+            self.channel_name
+        )
+        await self.accept()
+        await self.send_status_info()
+
+    async def disconnect(self, code):
+        await self.channel_layer.group_discard(
+            self.room_group_name,
+            self.channel_name
+        )
+        await self.channel_layer.group_discard(
+            "public_room",
+            self.channel_name
+        )
+
+    async def receive(self, text_data):
         data = json.loads(text_data)
-        player_id = data["player_id"]
-        player = Player.objects.get(id=player_id)
-        status = data['status']
-        player.status = status
-        player.save()
 
-        self.scope['session']['player_id'] = player_id
+        if self.game.status == GameStatus.WAITING:
+            if "game_status" in data:
+                self.game.status = data["game_status"]
+                await database_sync_to_async(self.game.save)()
+                await self.channel_layer.group_send(
+                    "public_room",
+                    {
+                        'type': 'send_message',
+                        'data': {"game_started": True}
+                    }
+                )
 
-        self.send_players_info()
+            else:
+                player_id = data["player_id"]
+                player = await database_sync_to_async(Player.objects.get)(id=player_id)
+                player.status = data['status']
+                await database_sync_to_async(player.save)()
+                await self.send_status_info()
 
-    def send_players_info(self):
+        else:
+            creator_id = await database_sync_to_async(lambda: self.game.creator.id)()
+            if 'create_round' in data and self.player.id == creator_id:
+                if data['create_round']:
+                    try:
+                        self.round_num = await get_round_num(self.game) + 1
+                    except:
+                        self.round_num = 1
+                    await self.create_round(round_num=self.round_num, game=self.game)
+
+            else:
+                round = await database_sync_to_async(Round.objects.get)(
+                    round_num=self.round_num,
+                    game=self.game,
+                )
+                leader = await database_sync_to_async(lambda: round.leader)()
+
+            if 'association_card' in data:
+                card = await database_sync_to_async(Card.objects.get)(id=data['association_card'])
+                self.player.status = PlayerStatus.READY
+                await database_sync_to_async(self.player.save)()
+
+                card = await database_sync_to_async(
+                    lambda: Card.objects.get(id=data['association_card'])
+                )()
+                await database_sync_to_async(Association.objects.create)(
+                    player=self.player,
+                    round=round,
+                    card=card
+                )
+
+                if self.player == leader:
+                    round.association_text = data['association_text']
+                    await database_sync_to_async(round.save)()
+                    players = await database_sync_to_async(
+                        lambda: list(
+                            self.game.players.exclude(id=self.player_id))
+                    )()
+                    for player in players:
+                        player.status = PlayerStatus.NOT_READY
+                        await database_sync_to_async(player.save)()
+
+                    data = {'association_text': round.association_text}
+                    await self.channel_layer.group_send(
+                        "public_room",
+                        {
+                            'type': 'send_message',
+                            'data': data
+                        }
+                    )
+                    await self.send_ready_and_points_info()
+                else:
+                    await self.send_ready_info()
+                    all_players_ready = await is_all_ready(self.game)
+
+                    if all_players_ready:
+                        players = await database_sync_to_async(
+                            lambda: list(self.game.players.all())
+                        )()
+                        for player in players:
+                            await self.channel_layer.group_send(
+                                f"player_{player.id}",
+                                {
+                                    'type': 'send_chosen_cards',
+                                }
+                            )
+
+            elif 'choice' in data:
+                self.player.status = PlayerStatus.READY
+                await database_sync_to_async(self.player.save)()
+
+                card = await database_sync_to_async(Card.objects.get)(id=data['choice'])
+
+                try:
+                    choice = await database_sync_to_async(Choice.objects.get)(
+                        round=round,
+                        player=self.player
+                    )
+                    choice.card = card
+                    await database_sync_to_async(choice.save)()
+
+                except Choice.DoesNotExist:
+                    await database_sync_to_async(Choice.objects.create)(
+                        round=round,
+                        player=self.player,
+                        card=card
+                    )
+                await self.send_ready_info()
+                all_players_ready = await is_all_ready(self.game)
+
+                if all_players_ready:
+                    await self.channel_layer.group_send(
+                        f"player_{self.player_id}",
+                        {
+                            "type": "calculate_results"
+                        }
+                    )
+
+    async def send_status_info(self):
         game_id = self.scope['url_route']['kwargs']['game_id']
-        game = Game.objects.get(id=game_id)
+        game = await database_sync_to_async(Game.objects.get)(id=game_id)
 
-        isReadyToPlay = game.players.count() == game.members_num
-
+        isReadyToPlay = await database_sync_to_async(game.players.count)() == game.members_num
         members = {}
-        for x in game.players.all():
-            members[x.id] = {'avatar': x.avatar, 'status': x.status}
+        players = await database_sync_to_async(list)(game.players.all())
+        for x in players:
+            members[str(x.id)] = {'avatar': x.avatar, 'status': x.status}
 
             if x.status != PlayerStatus.READY:
                 isReadyToPlay = False
 
         data = {'members': members, 'isReadyToPlay': isReadyToPlay}
-        self.send(text_data=json.dumps(data))
 
-
-class GamePrivateConsumer(WebsocketConsumer):
-    def connect(self):
-        pl_id = self.scope['session']['player_id']
-        pl_id_from_url = self.scope['url_route']['kwargs']['game_id']
-        if pl_id == pl_id_from_url:
-            self.accept()
-            self.player = Player.objects.get(id=pl_id)
-            self.room_name = f"player_{pl_id}"
-            self.channel_layer = get_channel_layer()
-            async_to_sync(self.channel_layer.group_add)(
-                self.room_name,
-                self.channel_name,
-            )
-        else:
-            self.close(code=4000)
-
-    def disconnect(self, code):
-        pass
-
-    def receive(self, text_data):
-        data = json.loads(text_data)
-        round_num = self.scope['session']['round_num']
-        round = Round.objects.get(self.player.game.round.get(round_num=round_num))
-
-        if 'association_card' in data:
-            card = Card.objects.get(id=data['association_card'])
-            Association.objects.create(player=self.player, round=round, card=card)
-
-        elif 'choice' in data:
-            self.player.status = PlayerStatus.READY
-            self.player.save()
-            card = Card.objects.get(id=data['choice'])
-            Choice.objects.update_or_create(round=round, player=self.player, card=card)
-
-            all_players_ready = is_all_ready(self.player)
-            if all_players_ready:
-                async_to_sync(self.channel_layer.group_send)("public_room", {
-                    "type": "calculate_results",
-                    "game": self.player.game
-                })
-
-    def send_player_info(self):
-        self.scope['session']['round_num'] = Round.objects.aggregate(
-                max_round=Max('round_num'))['max_round']
-        round = Round.objects.get(
-            game=self.player.game, round_num=self.scope['session'])
-
-        player_cards = PlayerCard.objects.filter(player=self.player)
-        player_cards = {obj.card.id: obj.card.img.url for obj in player_cards}
-
-        players = round.game.players.exclude(id=self.player.id)
-        players = {obj.id: {'avatar': obj.avatar, 'status': obj.status,
-                            'points': obj.points} for obj in players}
-
-        data = {'game_status': self.player.game.status,
-                'leader_id': round.leader.id, 'player_cards': player_cards, 'players': players}
-        self.send(text_data=json.dumps(data))
-
-    def send_ready_and_points_info(self):
-        players = self.player.game.players.exclude(id=self.player.id)
-        data = {obj.id: {'status': obj.status, 'points': obj.points}
-                for obj in players}
-        self.send(text_data=json.dumps(data))
-         
-    def send_chosen_cards(self):
-        round = Round.objects.get(game=Player.game)
-        for pl in round.game.players.exclude(id=round.leader.id):
-            pl.status = PlayerStatus.NOT_READY
-            pl.save()
-        pl.leader.status = PlayerStatus.READY
-        pl.save()
-
-        placeCards = {obj.card.id: obj.card.img.url for obj in Round.associations.all()}
-        pl_card = self.player.associations.get(round=round).card.id
-        data = {'your_card': pl_card, 'placeCards': placeCards}
-        self.send(text_data=json.dumps(data))
-
-
-class GamePublicConsumer(WebsocketConsumer):
-    def connect(self):
-        self.accept()
-        game_id = self.scope['url_route']['kwargs']['game_id']
-        game = Game.objects.get(id=game_id)
-        game.status = GameStatus.PLAYING
-
-        self.create_round(round_num=1, game=game)
-
-        self.room_name = "public_room"
-        self.channel_layer = get_channel_layer()
-        async_to_sync(self.channel_layer.group_add)(
-                self.room_name,
-                self.channel_name,
+        await self.channel_layer.group_send(
+            "public_room",
+            {
+                'type': 'send_message',
+                'data': data
+            }
         )
 
-    def disconnect(self, code):
-        pass
+    async def send_player_info(self, event):
+        self.round_num = await get_round_num(self.game)
 
-    def receive(self, text_data):
-        data = json.loads(text_data)
+        round = await database_sync_to_async(Round.objects.get)(
+            game=self.game,
+            round_num=self.round_num
+        )
 
-        player_id = self.scope['session']['player_id']
-        player = Player.objects.get(id=player_id)
+        player_cards = await database_sync_to_async(
+            lambda: list(self.player.cards.all())
+        )()
+        player_cards = {str(card.id): card.img.url for card in player_cards}
 
-        round_num = self.scope['session']['round_num']
-        round = player.game.rounds.get(round_num=round_num)
+        players = await database_sync_to_async(
+            lambda: list(Player.objects.filter(
+                game=self.game).exclude(id=self.player.id))
+        )()
+        players = {str(obj.id): {'avatar': obj.avatar, 'status': obj.status,
+                                 'points': obj.points} for obj in players}
+        leader_id = await database_sync_to_async(lambda: round.leader.id)()
 
-        if 'association_text' in data and player == round.leader:
-            player.status = PlayerStatus.READY
-            player.save()
+        data = {'game_status': self.game.status,
+                'leader_id': leader_id, 'player_cards': player_cards, 'players': players}
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                'type': 'send_message',
+                'data': data
+            }
+        )
 
-            round.association_text = data['association_text']
-            round.save()
-            Association.objects.create(player=player, round=round,
-                                       card=Card.objects.get(data['association_card']))
+    async def send_ready_and_points_info(self):
+        players = await database_sync_to_async(
+            lambda: list(self.game.players.exclude(id=self.player.id))
+        )()
+        data = {str(obj.id): {'status': obj.status, 'points': obj.points}
+                for obj in players}
 
-            for player in player.game.players.exclude(id=player_id):
-                player.status = PlayerStatus.NOT_READY
-                player.save()
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                'type': 'send_message',
+                'data': data
+            }
+        )
 
-            data = {'association_text': round.association_text}
-            self.send(text_data=json.dumps(data))
+    async def send_ready_info(self):
+        players = await database_sync_to_async(
+            lambda: list(self.game.players.all())
+        )()
+        data = {str(obj.id): obj.status for obj in players}
+        await self.channel_layer.group_send(
+            "public_room",
+            {
+                'type': 'send_message',
+                'data': data
+            }
+        )
 
-        elif 'status' in data:
-            player.status = data['status']
-            player.save()
+    async def send_chosen_cards(self, event):
+        round = await database_sync_to_async(Round.objects.get)(game=self.game, round_num=self.round_num)
+        players = await database_sync_to_async(
+            lambda: list(self.game.players.exclude(id=round.leader.id))
+        )()
 
-            async_to_sync(self.channel_layer.group_send)(f"player_{round.leader.id}", {
-                "type": "send_ready_and_points_info"
-            })
-
-            all_players_ready = is_all_ready(player)
-
-            if all_players_ready:
-                for player in player.game.players.all():
-                    async_to_sync(self.channel_layer.group_send)(f"player_{player.id}", {
-                        "type": "send_chosen_cards"
-                    })
-
-    def random_card_for_each_players(self, game, selected_cards):
-        for player in game.players.all():
-            cards = random.sample(selected_cards, 3)
-            if player.cards.count() != 0:
-                for card in player.cards.all():
-                    card.delete()
-            for card in cards:
-                PlayerCard.objects.create(player=player, card=card)
-            async_to_sync(self.channel_layer.group_send)(f"player_{player.id}", {
-                        "type": "send_player_info"
-                    })
-    
-    def calculate_results(self, game):
-        players = game.players.all()
-        round = Round.objects.get(game=game, round_num=self.scope['session']['round_num'])
-        winner = None
         for pl in players:
-            association = Association.objects.get(round=round, player=pl)
-            choices = Choice.objects.filter(card=association.card)
+            pl.status = PlayerStatus.NOT_READY
+            await database_sync_to_async(pl.save)()
+
+        leader = await database_sync_to_async(lambda: round.leader)()
+        leader.status = PlayerStatus.READY
+        await database_sync_to_async(round.save)()
+
+        pl_card = await database_sync_to_async(
+            lambda: Association.objects.get(
+                player=self.player, round=round).card.id
+        )()
+        association_cards = await database_sync_to_async(
+            lambda: [
+                obj.card for obj in round.associations.exclude(card=pl_card)]
+        )()
+        placeCards = {
+            str(card.id): card.img.url for card in association_cards
+        }
+
+        data = {'your_card': pl_card, 'placeCards': placeCards}
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                'type': 'send_message',
+                'data': data
+            }
+        )
+
+    async def calculate_results(self, event):
+        players = await database_sync_to_async(
+            lambda: list(self.game.players.all())
+        )()
+        self.round_num = await get_round_num(self.game)
+        game = self.game
+        for player in players:
+            round = await database_sync_to_async(Round.objects.get)(
+                game=game,
+                round_num=self.round_num
+            )
+            association = await database_sync_to_async(Association.objects.get)(
+                round=round,
+                player=player
+            )
+            choices = await database_sync_to_async(
+                lambda: list(Choice.objects.filter(
+                    card=association.card, round=round))
+            )()
             data = {}
-            
-            if pl == round.leader:
+
+            leader = await database_sync_to_async(lambda: round.leader)()
+            if player == leader:
                 points = 0
                 who_chose = []
-                if choices.exists() and choices.count() != players.count():
-                    points += 3 + choices.count()
-                    pl.points += points
-                    who_chose = [ch.player.id for ch in choices]
+
+                choices_count = len(choices)
+                players_count = await database_sync_to_async(game.players.count)()
+
+                if 0 < choices_count < players_count - 1:
+                    points += 3 + choices_count
+                    player.points += points
+                    who_chose = await database_sync_to_async(
+                        lambda: [ch.player.id for ch in choices]
+                    )()
 
             else:
-                leader_association = Association.objects.get(round=round, player=round.leader)
-                pl_association = Association.objects.get(round=round, player=pl)
-                pl_choice = Choice.objects.get(round=round, player=pl) 
+                leader_association_card = await database_sync_to_async(
+                    lambda: Association.objects.get(
+                        round=round, player=leader).card
+                )()
+                pl_choice_card = await database_sync_to_async(
+                    lambda: Choice.objects.get(round=round, player=player).card
+                )()
                 points = 0
                 guess_right = False
 
-                if leader_association.card == pl_choice.card:
+                if leader_association_card.id == pl_choice_card.id:
                     points += 3
                     guess_right = True
 
-                choices = Choice.objects.filter(card=pl_association.card)
-                points += choices.count()
-                who_chose = [ch.player.id for ch in choices]
+                points += len(choices)
+                player.points += points
+                who_chose = await database_sync_to_async(lambda: [ch.player.id for ch in choices])()
                 data.update({'guess_right': guess_right})
 
-            pl.points += points
-            data.update({"who_chose_your_cards": who_chose, "points_for_round": points, "all_points": pl.points})
-            
-            async_to_sync(self.channel_layer.group_send)(f"player_{pl.id}", {
-                "type": "send",
-                "text_data": json.dumps(data)
-            })
+            data.update({"who_chose_your_cards": who_chose,
+                        "points_for_round": points, "all_points": player.points})
 
-            if pl.points >= pl.game.points_to_win:
-                winner = pl
+            await database_sync_to_async(player.save)()
 
+            if player.points >= self.game.points_to_win:
+                self.game.status = GameStatus.FINISHED
+                self.game.winner = await database_sync_to_async(
+                    lambda: player if player.points > self.game.winner.points else self.game.winner
+                )()
+                await database_sync_to_async(self.game.save)()
+
+            await self.channel_layer.group_send(
+                f"player_{player.id}",
+                {
+                    'type': 'send_message',
+                    'data': data
+                }
+            )
+        winner = await database_sync_to_async(lambda: game.winner)()
         if winner:
-            winner.game.status = GameStatus.FINISHED
-            game.winner = winner
-            winner.game.save()
-            self.send(text_data=json.dumps({'winner_id': winner.id}))
-        else:
-            self.create_round(round_num=self.scope['session']['round_num'], game=game)
+            await self.channel_layer.group_send(
+                "public_room",
+                {
+                    "type": "send_message",
+                    "data": {"winner": winner.id}
+                }
+            )
 
-    def create_round(self, round_num, game):
-        try:
-            round = Round.objects.get(game=game, round_num=round_num)
-        except:
-            Round.objects.create(game=game, round_num=round_num,
-                             leader=random.choice(game.players.all()))
-
+    async def create_round(self, round_num, game):
+        players = await database_sync_to_async(list)(game.players.all())
+        await database_sync_to_async(Round.objects.create)(
+            game=game,
+            round_num=round_num,
+            leader=random.choice(players)
+        )
         cards_count = game.members_num * 4
-        selected_cards = random.sample(game.deck.cards.all(), cards_count)
+        all_cards = await database_sync_to_async(
+            lambda: list(Card.objects.filter(deck=game.deck))
+        )()
+
+        selected_cards = random.sample(all_cards, cards_count)
         for card in selected_cards:
-            GameCard.objects.create(game=game, card=card)
-        self.random_card_for_each_players(game, selected_cards)
+            await database_sync_to_async(self.game.cards.add)(card)
+        await self.random_card_for_each_players(game, selected_cards, players)
+
+    async def random_card_for_each_players(self, game, selected_cards, players):
+        for player in players:
+            cards = random.sample(selected_cards, 4)
+
+            cards_count = await database_sync_to_async(player.cards.count)()
+
+            if cards_count != 0:
+                player_cards = await database_sync_to_async(list)(player.cards.all())
+                for card in player_cards:
+                    await database_sync_to_async(lambda: player.cards.remove(card))()
+
+            for card in cards:
+                selected_cards.remove(card)
+                player_cards_list = []
+
+                player_card = await database_sync_to_async(player.cards.add)(card)
+                player_cards_list.append(player_card)
+            await self.channel_layer.group_send(
+                f"player_{player.id}",
+                {
+                    'type': 'send_player_info'
+                }
+            )
+
+    async def send_message(self, event):
+        data = event['data']
+        await self.send(text_data=json.dumps(data))
 
 
-def is_all_ready(player):
+@database_sync_to_async
+def is_all_ready(game):
     all_players_ready = True
-    for x in player.game.players.exclude(id=player.id):
-        if x.status != PlayerStatus.READY:
+    for x in game.players.all():
+        if x.status == PlayerStatus.NOT_READY:
             all_players_ready = False
     return all_players_ready
+
+
+@database_sync_to_async
+def get_round_num(game):
+    result = Round.objects.filter(game=game).aggregate(
+        max_round=Max('round_num'))
+    return result['max_round']
