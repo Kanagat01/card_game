@@ -39,7 +39,7 @@ class Game(models.Model):
     members_num = models.IntegerField(choices=MEMBER_NUM_CHOICES)
     points_to_win = models.IntegerField()
     status = models.CharField(
-        max_length=2, choices=GameStatus.choices, default=GameStatus.PLAYING)
+        max_length=2, choices=GameStatus.choices, default=GameStatus.WAITING)
     winner = models.ForeignKey(
         Player, on_delete=models.SET_NULL, null=True, blank=True, related_name='won_games')
 

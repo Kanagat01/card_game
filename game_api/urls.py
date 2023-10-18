@@ -5,4 +5,5 @@ urlpatterns = [
     path('player/create/', CreatePlayer.as_view(), name='create_player'),
     path('game/create/', CreateGame.as_view(), name='create_game'),
     path('review/create/', CreateReview.as_view(), name='create_review'),
+    path('deck_list/', DeckList.as_view(), name='deck_list'),
 ]
