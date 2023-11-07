@@ -9,21 +9,21 @@ from .models import *
 
 class GameConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        self.game = await database_sync_to_async(Game.objects.get)(
-            id=self.scope['url_route']['kwargs']['game_id']
+        self.game_id = self.scope['url_route']['kwargs']['game_id']
+        game = await database_sync_to_async(Game.objects.get)(
+            id=self.game_id
         )
-        await database_sync_to_async(self.game.save)()
         try:
-            self.round_num = await get_round_num(self.game)
+            self.round_num = await get_round_num(game)
         except:
             pass
 
-        self.player_id = self.scope['url_route']['kwargs']['player_id']
+        player_id = self.scope['url_route']['kwargs']['player_id']
         self.player = await database_sync_to_async(Player.objects.get)(
-            id=self.player_id
+            id=player_id
         )
 
-        self.room_group_name = f"player_{self.player_id}"
+        self.room_group_name = f"player_{self.player.id}"
         await self.channel_layer.group_add(
             self.room_group_name,
             self.channel_name
@@ -48,18 +48,22 @@ class GameConsumer(AsyncWebsocketConsumer):
 
     async def receive(self, text_data):
         data = json.loads(text_data)
+        game = await database_sync_to_async(Game.objects.get)(
+            id=self.game_id
+        )
 
-        if self.game.status == GameStatus.WAITING:
+        if game.status == GameStatus.WAITING:
             if "game_status" in data:
-                self.game.status = data["game_status"]
-                await database_sync_to_async(self.game.save)()
-                await self.channel_layer.group_send(
-                    "public_room",
-                    {
-                        'type': 'send_message',
-                        'data': {"game_started": True}
-                    }
-                )
+                if data["game_status"] == GameStatus.PLAYING:
+                    game.status = data["game_status"]
+                    await database_sync_to_async(game.save)()
+                    await self.channel_layer.group_send(
+                        "public_room",
+                        {
+                            'type': 'send_message',
+                            'data': {"game_started": True}
+                        }
+                    )
 
             else:
                 player_id = data["player_id"]
@@ -69,42 +73,50 @@ class GameConsumer(AsyncWebsocketConsumer):
                 await self.send_status_info()
 
         else:
-            creator_id = await database_sync_to_async(lambda: self.game.creator.id)()
+            creator_id = await database_sync_to_async(lambda: game.creator.id)()
             if 'create_round' in data and self.player.id == creator_id:
                 if data['create_round']:
                     try:
-                        self.round_num = await get_round_num(self.game) + 1
+                        self.round_num = await get_round_num(game) + 1
                     except:
                         self.round_num = 1
-                    await self.create_round(round_num=self.round_num, game=self.game)
+                    await self.create_round(round_num=self.round_num, game=game)
 
             else:
                 round = await database_sync_to_async(Round.objects.get)(
                     round_num=self.round_num,
-                    game=self.game,
+                    game=game,
                 )
                 leader = await database_sync_to_async(lambda: round.leader)()
 
             if 'association_card' in data:
-                card = await database_sync_to_async(Card.objects.get)(id=data['association_card'])
                 self.player.status = PlayerStatus.READY
                 await database_sync_to_async(self.player.save)()
 
                 card = await database_sync_to_async(
                     lambda: Card.objects.get(id=data['association_card'])
                 )()
-                await database_sync_to_async(Association.objects.create)(
-                    player=self.player,
-                    round=round,
-                    card=card
-                )
+                try:
+                    association = await database_sync_to_async(Association.objects.get)(
+                        player=self.player,
+                        round=round
+                    )
+                    await database_sync_to_async(association.update)(
+                        card=card
+                    )
+                except:
+                    await database_sync_to_async(Association.objects.create)(
+                        player=self.player,
+                        round=round,
+                        card=card
+                    )
 
                 if self.player == leader:
                     round.association_text = data['association_text']
                     await database_sync_to_async(round.save)()
                     players = await database_sync_to_async(
                         lambda: list(
-                            self.game.players.exclude(id=self.player_id))
+                            game.players.exclude(id=self.player.id))
                     )()
                     for player in players:
                         player.status = PlayerStatus.NOT_READY
@@ -121,11 +133,11 @@ class GameConsumer(AsyncWebsocketConsumer):
                     await self.send_ready_and_points_info()
                 else:
                     await self.send_ready_info()
-                    all_players_ready = await is_all_ready(self.game)
+                    all_players_ready = await is_all_ready(game)
 
                     if all_players_ready:
                         players = await database_sync_to_async(
-                            lambda: list(self.game.players.all())
+                            lambda: list(game.players.all())
                         )()
                         for player in players:
                             await self.channel_layer.group_send(
@@ -156,11 +168,11 @@ class GameConsumer(AsyncWebsocketConsumer):
                         card=card
                     )
                 await self.send_ready_info()
-                all_players_ready = await is_all_ready(self.game)
+                all_players_ready = await is_all_ready(game)
 
                 if all_players_ready:
                     await self.channel_layer.group_send(
-                        f"player_{self.player_id}",
+                        f"player_{self.player.id}",
                         {
                             "type": "calculate_results"
                         }
@@ -190,10 +202,13 @@ class GameConsumer(AsyncWebsocketConsumer):
         )
 
     async def send_player_info(self, event):
-        self.round_num = await get_round_num(self.game)
+        game = await database_sync_to_async(Game.objects.get)(
+            id=self.game_id
+        )
+        self.round_num = await get_round_num(game)
 
         round = await database_sync_to_async(Round.objects.get)(
-            game=self.game,
+            game=game,
             round_num=self.round_num
         )
 
@@ -204,13 +219,13 @@ class GameConsumer(AsyncWebsocketConsumer):
 
         players = await database_sync_to_async(
             lambda: list(Player.objects.filter(
-                game=self.game).exclude(id=self.player.id))
+                game=game).exclude(id=self.player.id))
         )()
         players = {str(obj.id): {'avatar': obj.avatar, 'status': obj.status,
                                  'points': obj.points} for obj in players}
         leader_id = await database_sync_to_async(lambda: round.leader.id)()
 
-        data = {'game_status': self.game.status,
+        data = {'game_status': game.status,
                 'leader_id': leader_id, 'player_cards': player_cards, 'players': players}
         await self.channel_layer.group_send(
             self.room_group_name,
@@ -221,8 +236,9 @@ class GameConsumer(AsyncWebsocketConsumer):
         )
 
     async def send_ready_and_points_info(self):
+        game = await database_sync_to_async(Game.objects.get)(id=self.game_id)
         players = await database_sync_to_async(
-            lambda: list(self.game.players.exclude(id=self.player.id))
+            lambda: list(game.players.exclude(id=self.player.id))
         )()
         data = {str(obj.id): {'status': obj.status, 'points': obj.points}
                 for obj in players}
@@ -236,8 +252,9 @@ class GameConsumer(AsyncWebsocketConsumer):
         )
 
     async def send_ready_info(self):
+        game = await database_sync_to_async(Game.objects.get)(id=self.game_id)
         players = await database_sync_to_async(
-            lambda: list(self.game.players.all())
+            lambda: list(game.players.all())
         )()
         data = {str(obj.id): obj.status for obj in players}
         await self.channel_layer.group_send(
@@ -249,9 +266,10 @@ class GameConsumer(AsyncWebsocketConsumer):
         )
 
     async def send_chosen_cards(self, event):
-        round = await database_sync_to_async(Round.objects.get)(game=self.game, round_num=self.round_num)
+        game = await database_sync_to_async(Game.objects.get)(id=self.game_id)
+        round = await database_sync_to_async(Round.objects.get)(game=game, round_num=self.round_num)
         players = await database_sync_to_async(
-            lambda: list(self.game.players.exclude(id=round.leader.id))
+            lambda: list(game.players.exclude(id=round.leader.id))
         )()
 
         for pl in players:
@@ -284,11 +302,13 @@ class GameConsumer(AsyncWebsocketConsumer):
         )
 
     async def calculate_results(self, event):
+        game = await database_sync_to_async(Game.objects.get)(
+            id=self.game_id
+        )
         players = await database_sync_to_async(
-            lambda: list(self.game.players.all())
+            lambda: list(Player.objects.filter(game=game))
         )()
-        self.round_num = await get_round_num(self.game)
-        game = self.game
+        self.round_num = await get_round_num(game)
         for player in players:
             round = await database_sync_to_async(Round.objects.get)(
                 game=game,
@@ -305,8 +325,9 @@ class GameConsumer(AsyncWebsocketConsumer):
             data = {}
 
             leader = await database_sync_to_async(lambda: round.leader)()
+            points = 0
+
             if player == leader:
-                points = 0
                 who_chose = []
 
                 choices_count = len(choices)
@@ -327,7 +348,6 @@ class GameConsumer(AsyncWebsocketConsumer):
                 pl_choice_card = await database_sync_to_async(
                     lambda: Choice.objects.get(round=round, player=player).card
                 )()
-                points = 0
                 guess_right = False
 
                 if leader_association_card.id == pl_choice_card.id:
@@ -336,20 +356,24 @@ class GameConsumer(AsyncWebsocketConsumer):
 
                 points += len(choices)
                 player.points += points
+
                 who_chose = await database_sync_to_async(lambda: [ch.player.id for ch in choices])()
                 data.update({'guess_right': guess_right})
+
+            await database_sync_to_async(player.save)()
 
             data.update({"who_chose_your_cards": who_chose,
                         "points_for_round": points, "all_points": player.points})
 
-            await database_sync_to_async(player.save)()
-
-            if player.points >= self.game.points_to_win:
-                self.game.status = GameStatus.FINISHED
-                self.game.winner = await database_sync_to_async(
-                    lambda: player if player.points > self.game.winner.points else self.game.winner
-                )()
-                await database_sync_to_async(self.game.save)()
+            if player.points >= game.points_to_win:
+                game.status = GameStatus.FINISHED
+                if game.winner:
+                    game.winner = await database_sync_to_async(
+                        lambda: player if player.points > game.winner.points else game.winner
+                    )()
+                else:
+                    game.winner = player
+                await database_sync_to_async(game.save)()
 
             await self.channel_layer.group_send(
                 f"player_{player.id}",
@@ -358,6 +382,7 @@ class GameConsumer(AsyncWebsocketConsumer):
                     'data': data
                 }
             )
+
         winner = await database_sync_to_async(lambda: game.winner)()
         if winner:
             await self.channel_layer.group_send(
@@ -370,6 +395,9 @@ class GameConsumer(AsyncWebsocketConsumer):
 
     async def create_round(self, round_num, game):
         players = await database_sync_to_async(list)(game.players.all())
+        for player in players:
+            player.status = PlayerStatus.NOT_READY
+            await database_sync_to_async(player.save)()
         await database_sync_to_async(Round.objects.create)(
             game=game,
             round_num=round_num,
@@ -382,7 +410,7 @@ class GameConsumer(AsyncWebsocketConsumer):
 
         selected_cards = random.sample(all_cards, cards_count)
         for card in selected_cards:
-            await database_sync_to_async(self.game.cards.add)(card)
+            await database_sync_to_async(game.cards.add)(card)
         await self.random_card_for_each_players(game, selected_cards, players)
 
     async def random_card_for_each_players(self, game, selected_cards, players):
